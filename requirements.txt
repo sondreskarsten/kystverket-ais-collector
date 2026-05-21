@@ -1,0 +1,3 @@
+pyarrow
+google-auth
+requests
