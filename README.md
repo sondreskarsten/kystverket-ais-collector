@@ -52,7 +52,7 @@ Note: `calc_speed`, `delta_seconds`, `delta_meters` are pre-computed server-side
 |---|---|---|
 | `WINDOW_START` | required | ISO datetime, e.g. `2025-04-01T00:00:00` |
 | `WINDOW_END` | required | ISO datetime (exclusive), e.g. `2025-07-01T00:00:00` |
-| `WORKERS` | 8 | Hard ceiling; >8 hits PostgreSQL `53300: too many clients` |
+| `WORKERS` | 6 | Hard ceiling 8 (PG 53300 at 16+); 6 recommended for 16Gi memory headroom |
 | `RUN_ID` | derived from window | e.g. `20250401_20250701` |
 | `GCS_BUCKET` | `sondre_brreg_data` | |
 | `GCS_PREFIX` | `ais/raw` | |
@@ -64,9 +64,10 @@ The job reads `_checkpoint/positions/{RUN_ID}.json` at start. Re-running with th
 ## Throughput benchmarks (empirical, May 2026)
 
 - 1-hour API call: ~35–50s wall-clock, ~280–415k position rows, ~25–37 MB JSON response → ~5–7 MB snappy parquet (~5× compression)
-- 8 workers: ~13s effective per hour-chunk
-- 3-month backfill (2 184 hours): ~8 hours job time
-- Daily incremental (24 hours): ~5 minutes job time
+- 6 workers: ~15s effective per hour-chunk
+- 3-month backfill (2 184 hours): ~9 hours job time
+- Daily incremental (24 hours): ~6 minutes job time
+- Memory: 4Gi OOMs at WORKERS=8 during sustained backfill; 16Gi with WORKERS=6 is stable
 
 ## Retry policy
 
@@ -89,10 +90,10 @@ gcloud run jobs create kystverket-ais-collector \
   --image europe-north1-docker.pkg.dev/sondreskarsten-d7d14/brreg-pipelines/kystverket-ais-collector:latest \
   --region europe-north1 \
   --service-account s1sfreracct@sondreskarsten-d7d14.iam.gserviceaccount.com \
-  --memory 2Gi --cpu 2 \
+  --memory 16Gi --cpu 4 \
   --task-timeout 24h \
   --max-retries 1 \
-  --set-env-vars WORKERS=8
+  --set-env-vars WORKERS=6
 
 # Run backfill for 3-month window
 gcloud run jobs execute kystverket-ais-collector \
