@@ -101,39 +101,59 @@ def collect_positions_hour(hour_start, fs, run_id, max_retries=5):
             'msg':(d.get('msg') or '')[:200],
             'captured_at':captured_at.isoformat(),'rows':n,'bytes':sz,'elapsed':el,'run_id':run_id,'path':out_path}
 
-def collect_statinfo_day(day_start, mmsi_list, fs, run_id):
-    day_end = day_start + timedelta(days=1)
-    start_str = day_start.strftime('%Y%m%d%H%M')
-    end_str = (day_end - timedelta(minutes=1)).strftime('%Y%m%d%H%M')
+def collect_statinfo_day(day_start, mmsi_list, fs, run_id, max_retries=5):
+    """Pull NSR vessel registry data for the MMSIs observed on this day.
+
+    Despite the name (kept for pipeline-shape compatibility), this uses
+    /api/ship/data/nsr/for-mmsis-imos which returns the actual rich vessel
+    registry (callsign, shipname, IMO, dimensions, ship type, build year,
+    tonnage, flag) — unlike /api/ais/statinfo/for-mmsis-time which is
+    nominally about Type 5 messages but returns only nulls in the public tier.
+    """
     captured_at = datetime.now(timezone.utc)
     all_rows = []
     total_bytes = 0
     total_elapsed = 0.0
     errs = []
-    for chunk_i in range(0, len(mmsi_list), 500):
-        chunk = mmsi_list[chunk_i:chunk_i+500]
-        body = {"mmsiIds": chunk, "start": start_str, "end": end_str}
-        try:
-            d, sz, el = post('/ais/statinfo/for-mmsis-time', body)
-            total_bytes += sz
-            total_elapsed += el
-            if d.get('data'):
-                all_rows.extend(d['data'])
-        except Exception as e:
-            errs.append(f"chunk{chunk_i}: {type(e).__name__}: {e}")
+    CHUNK = 2000
+    for chunk_i in range(0, len(mmsi_list), CHUNK):
+        chunk = mmsi_list[chunk_i:chunk_i+CHUNK]
+        body = {"mmsi": chunk, "imo": []}
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                d, sz, el = post('/ship/data/nsr/for-mmsis-imos', body)
+                msg = (d.get('msg') or '')
+                if 'too many clients' in msg or '53300' in msg or 'deadlock' in msg.lower():
+                    last_err = msg[:120]
+                    time.sleep(2 + attempt * 3)
+                    continue
+                total_bytes += sz
+                total_elapsed += el
+                if d.get('data'):
+                    all_rows.extend(d['data'])
+                last_err = None
+                break
+            except Exception as e:
+                last_err = f'{type(e).__name__}: {str(e)[:120]}'
+                time.sleep(2 + attempt * 3)
+        if last_err:
+            errs.append(f"chunk{chunk_i}: {last_err}")
     out_path = f"{BUCKET}/{PREFIX}/statinfo/year={day_start.year:04d}/month={day_start.month:02d}/day={day_start.day:02d}.parquet"
     if all_rows:
-        all_keys = list(all_rows[0].keys())
+        all_keys = sorted({k for r in all_rows for k in r.keys()})
         cols = {k: [r.get(k) for r in all_rows] for k in all_keys}
         table = pa.table(cols)
     else:
-        table = pa.table({'mmsi': pa.array([], type=pa.int64()), 'imo_num':pa.array([], type=pa.int64()),
-                          'name':pa.array([], type=pa.string()), 'callsign':pa.array([], type=pa.string())})
-    meta = {b'source':b'kystdatahuset', b'endpoint':b'/api/ais/statinfo/for-mmsis-time',
+        table = pa.table({'mmsino': pa.array([], type=pa.int64()),
+                          'shipname':pa.array([], type=pa.string()),
+                          'callsign':pa.array([], type=pa.string())})
+    meta = {b'source':b'kystdatahuset', b'endpoint':b'/api/ship/data/nsr/for-mmsis-imos',
             b'day':day_start.strftime('%Y-%m-%d').encode(),
-            b'mmsi_count':str(len(mmsi_list)).encode(), b'chunk_size':b'500',
+            b'mmsi_count':str(len(mmsi_list)).encode(), b'chunk_size':str(CHUNK).encode(),
             b'captured_at':captured_at.isoformat().encode(), b'run_id':run_id.encode(),
-            b'response_bytes':str(total_bytes).encode(), b'api_elapsed_s':f'{total_elapsed:.3f}'.encode()}
+            b'response_bytes':str(total_bytes).encode(), b'api_elapsed_s':f'{total_elapsed:.3f}'.encode(),
+            b'note':b'pulls NSR vessel registry (callsign/shipname/IMO/dims/type/build/tonnage/flag); replaces broken /ais/statinfo/* endpoint'}
     if errs:
         meta[b'errors'] = '\n'.join(errs).encode()
     table = table.replace_schema_metadata(meta)
@@ -144,7 +164,7 @@ def collect_statinfo_day(day_start, mmsi_list, fs, run_id):
             'elapsed':total_elapsed,'captured_at':captured_at.isoformat(),'run_id':run_id,'path':out_path,
             'errors':errs}
 
-def collect_voyages_day(day_start, mmsi_list, fs, run_id):
+def collect_voyages_day(day_start, mmsi_list, fs, run_id, max_retries=5):
     day_end = day_start + timedelta(days=1)
     start_str = day_start.strftime('%Y-%m-%dT%H:%M:%S')
     end_str = (day_end - timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%S')
@@ -153,17 +173,30 @@ def collect_voyages_day(day_start, mmsi_list, fs, run_id):
     total_bytes = 0
     total_elapsed = 0.0
     errs = []
-    for chunk_i in range(0, len(mmsi_list), 500):
-        chunk = mmsi_list[chunk_i:chunk_i+500]
+    CHUNK = 2000
+    for chunk_i in range(0, len(mmsi_list), CHUNK):
+        chunk = mmsi_list[chunk_i:chunk_i+CHUNK]
         body = {"mmsiIds": chunk, "startTime": start_str, "endTime": end_str}
-        try:
-            d, sz, el = post('/voyage/for-ships/by-mmsi', body)
-            total_bytes += sz
-            total_elapsed += el
-            if d.get('data'):
-                all_rows.extend(d['data'])
-        except Exception as e:
-            errs.append(f"chunk{chunk_i}: {type(e).__name__}: {e}")
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                d, sz, el = post('/voyage/for-ships/by-mmsi', body)
+                msg = (d.get('msg') or '')
+                if 'too many clients' in msg or '53300' in msg or 'deadlock' in msg.lower():
+                    last_err = msg[:120]
+                    time.sleep(2 + attempt * 3)
+                    continue
+                total_bytes += sz
+                total_elapsed += el
+                if d.get('data'):
+                    all_rows.extend(d['data'])
+                last_err = None
+                break
+            except Exception as e:
+                last_err = f'{type(e).__name__}: {str(e)[:120]}'
+                time.sleep(2 + attempt * 3)
+        if last_err:
+            errs.append(f"chunk{chunk_i}: {last_err}")
     out_path = f"{BUCKET}/{PREFIX}/voyages/year={day_start.year:04d}/month={day_start.month:02d}/day={day_start.day:02d}.parquet"
     if all_rows:
         all_keys = sorted({k for r in all_rows for k in r.keys()})
@@ -174,7 +207,7 @@ def collect_voyages_day(day_start, mmsi_list, fs, run_id):
                           'destination':pa.array([], type=pa.string())})
     meta = {b'source':b'kystdatahuset', b'endpoint':b'/api/voyage/for-ships/by-mmsi',
             b'day':day_start.strftime('%Y-%m-%d').encode(),
-            b'mmsi_count':str(len(mmsi_list)).encode(), b'chunk_size':b'500',
+            b'mmsi_count':str(len(mmsi_list)).encode(), b'chunk_size':str(CHUNK).encode(),
             b'captured_at':captured_at.isoformat().encode(), b'run_id':run_id.encode(),
             b'response_bytes':str(total_bytes).encode(), b'api_elapsed_s':f'{total_elapsed:.3f}'.encode()}
     if errs:

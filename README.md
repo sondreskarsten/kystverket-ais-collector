@@ -104,8 +104,26 @@ Cloud Scheduler in `europe-west1` triggers daily, passing yesterday's date windo
 
 ## Not yet implemented
 
-- `statinfo` collector (Type 5/24 vessel static data, MMSI-list scoped, per-day chunking)
-- `voyages` collector (Kystverket's pre-computed voyage segments, MMSI-list scoped, per-day chunking)
 - Daily incremental scheduler
 - BarentsWatch real-time companion collector for the 14-day window (`barentswatch-ais-collector` repo)
 - TCP NMEA receiver for full Type 5/24 message richness (`kystverket-ais-tcp-receiver` repo)
+
+## Companion entrypoint: statinfo+voyages
+
+The same image also ships `entrypoint_statinfo_voyages.py`. For each day in the window it reads all 24 position parquets, extracts the distinct MMSIs that transmitted, and pulls:
+
+- **statinfo** via `POST /api/ship/data/nsr/for-mmsis-imos` — NSR vessel registry: `shipname`, `callsign`, `imono`, dimensions, `shiptypenor`, build year, tonnage, flag (`countrynameeng`). ~58% of MMSIs observed resolve (Norwegian + frequent-visitor foreign vessels). The nominally-named `/api/ais/statinfo/for-mmsis-time` endpoint returns nulls in the public tier — do NOT use it.
+- **voyages** via `POST /api/voyage/for-ships/by-mmsi` — Kystverket's pre-computed voyage segments with origin/destination ports, ETD/ETA, cargo quantities. ~50% of MMSIs have voyage rows for a given day.
+
+Outputs:
+```
+ais/raw/statinfo/year=YYYY/month=MM/day=DD.parquet
+ais/raw/voyages/year=YYYY/month=MM/day=DD.parquet
+ais/raw/_checkpoint/statinfo_voyages/{RUN_ID}.json
+ais/raw/_manifest/statinfo_voyages_run={RUN_ID}.jsonl
+```
+
+Skips any day where fewer than 24 position parquets exist. Re-run after positions backfill completes for that day.
+
+To run: override `CMD` to `python3 entrypoint_statinfo_voyages.py`.
+
