@@ -27,22 +27,24 @@ gs://sondre_brreg_data/ais/raw/
 └── _manifest/run={RUN_ID}.jsonl          per-call audit (timing, row counts, errors)
 ```
 
-Position parquet columns (raw from API, unnamed columns 4–11 await parser decoding):
+Position parquet columns (decoded May 2026 via cross-vessel statistical analysis + exact numerical verification):
 
-| col | type | meaning (provisional) |
-|---|---|---|
-| `mmsi` | int64 | Maritime Mobile Service Identity |
-| `msgtime` | string | ISO datetime, Oslo local time |
-| `lon` | double | longitude WGS84 |
-| `lat` | double | latitude WGS84 |
-| `c4` | double | likely SOG (speed over ground, knots) |
-| `c5` | double | likely COG (course over ground) or heading-related |
-| `c6` | int64 | likely ship_type |
-| `c7` | double | likely additional speed/heading metric |
-| `c8` | int64 | likely heading degrees |
-| `c9` | int64 | likely navigational status |
-| `c10` | int64 | likely true_heading (511 = N/A) |
-| `c11` | int64 | likely rate_of_turn signed |
+| col | name | type | description | sentinel |
+|---|---|---|---|---|
+| `mmsi` | mmsi | int64 | Maritime Mobile Service Identity | — |
+| `msgtime` | msgtime | string | ISO datetime (Oslo local time, not UTC) | — |
+| `lon` | lon | double | longitude WGS84 | — |
+| `lat` | lat | double | latitude WGS84 | — |
+| `c4` | cog | double | course over ground, degrees | 360.0 = NA |
+| `c5` | sog | double | speed over ground, knots (from AIS message) | 102.3 = NA |
+| `c6` | msg_type | int64 | AIS message type (1=ClassA pos, 3=ClassA pos, 18=ClassB pos) | — |
+| `c7` | calc_speed | double | calculated speed from consecutive position deltas, knots | -99 = NA (Class B or first point) |
+| `c8` | delta_seconds | int64 | seconds since previous position for this MMSI | -99 = NA |
+| `c9` | delta_meters | int64 | distance from previous position, meters | -99 = NA |
+| `c10` | true_heading | int64 | true heading, degrees | 511 = NA |
+| `c11` | rot | int64 | rate of turn, decoded °/min | -731 = NA/max left, -99 = Class B NA |
+
+Note: `calc_speed`, `delta_seconds`, `delta_meters` are pre-computed server-side by kystdatahuset — these are exactly the fields MarU uses for voyage segmentation (`delta_previous_point_seconds`, `distance_previous_point_meters`). The collector preserves them as-is in the raw capture.
 
 ## Environment variables
 
