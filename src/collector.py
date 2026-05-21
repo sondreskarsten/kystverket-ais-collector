@@ -79,7 +79,15 @@ def collect_positions_hour(hour_start, fs, run_id, max_retries=5):
     n = len(rows)
     if n > 0:
         cols = {POSITION_COLS[i]: [r[i] if i < len(r) else None for r in rows] for i in range(len(POSITION_COLS))}
-        table = pa.table(cols)
+        POSITION_TYPES = {
+            'mmsi': pa.int64(), 'msgtime': pa.string(),
+            'lon': pa.float64(), 'lat': pa.float64(),
+            'c4': pa.float64(), 'c5': pa.float64(), 'c6': pa.int64(),
+            'c7': pa.float64(), 'c8': pa.int64(), 'c9': pa.int64(),
+            'c10': pa.int64(), 'c11': pa.int64(),
+        }
+        arrays = {k: pa.array(v, type=POSITION_TYPES[k]) for k, v in cols.items()}
+        table = pa.table(arrays)
         meta = {b'source':b'kystdatahuset', b'endpoint':b'/api/ais/positions/within-geom-time',
                 b'geom':EEZ_POLYGON.encode(), b'start':start_str.encode(), b'end':end_str.encode(),
                 b'captured_at':captured_at.isoformat().encode(), b'run_id':run_id.encode(),
@@ -88,7 +96,20 @@ def collect_positions_hour(hour_start, fs, run_id, max_retries=5):
         with fs.open_output_stream(out_path, compression=None) as f:
             pq.write_table(table, f, compression='snappy', use_dictionary=True, row_group_size=200000)
     else:
-        empty = pa.table({c: pa.array([], type=pa.string() if c=='msgtime' else pa.float64() if c in ('lon','lat') else pa.int64()) for c in POSITION_COLS})
+        empty = pa.table({
+            'mmsi': pa.array([], type=pa.int64()),
+            'msgtime': pa.array([], type=pa.string()),
+            'lon': pa.array([], type=pa.float64()),
+            'lat': pa.array([], type=pa.float64()),
+            'c4': pa.array([], type=pa.float64()),
+            'c5': pa.array([], type=pa.float64()),
+            'c6': pa.array([], type=pa.int64()),
+            'c7': pa.array([], type=pa.float64()),
+            'c8': pa.array([], type=pa.int64()),
+            'c9': pa.array([], type=pa.int64()),
+            'c10': pa.array([], type=pa.int64()),
+            'c11': pa.array([], type=pa.int64()),
+        })
         meta = {b'source':b'kystdatahuset', b'endpoint':b'/api/ais/positions/within-geom-time',
                 b'geom':EEZ_POLYGON.encode(), b'start':start_str.encode(), b'end':end_str.encode(),
                 b'captured_at':captured_at.isoformat().encode(), b'run_id':run_id.encode(),
