@@ -1,83 +1,65 @@
 # kystverket-ais-collector
 
-Collects AIS vessel position data from the Norwegian Coastal Administration's public data portal (kystdatahuset.no) for every vessel in Norwegian waters. Writes raw observation parquets to GCS — one file per hour for positions, one per day for vessel registry and voyage data.
+Bulk AIS position collector for the Norwegian EEZ from kystdatahuset.no. Writes one parquet per hour for positions, one per day for vessel registry (NSR statinfo) and pre-computed voyages.
 
-## What is AIS data?
+## Source
 
-Every vessel above 15 meters (fishing) or 300 GT (cargo) is legally required to broadcast its position via the Automatic Identification System (AIS). The broadcast happens every 2-10 seconds and includes: vessel identity (MMSI number), position (GPS coordinates), speed over ground, course, heading, and rate of turn.
+Kystdatahuset is the Norwegian Coastal Administration's public data portal. The endpoint `POST /api/ais/positions/within-geom-time` returns an unnamed 12-element array per position report for every vessel inside a bounding polygon during a time window.
 
-This is **real-time operational telemetry** for the entire Norwegian merchant and fishing fleet. Unlike financial statements (which arrive 6-18 months late) or catch data (which arrives with weeks of delay), AIS positions show what a vessel is doing *right now*.
+No auth. No published rate limit, but the PostgreSQL backend caps at ~8 concurrent connections (exceeding returns `53300: too many clients` embedded in JSON). We use 6 parallel workers.
 
-## Why does a credit analyst care?
+**Recency lag**: ~50 days. Data for today is not available until approximately 50 days later. This is a backend ingestion pipeline delay, not a policy choice. For real-time positions, use barentswatch-ais-live.
 
-AIS data answers questions that no financial report can:
+## Column mapping
 
-- **Is the vessel actually fishing?** A vessel that hasn't left port in 3 weeks may have mechanical issues, a crew shortage, or financial distress (can't afford fuel). This is visible from AIS before it's visible anywhere else.
-- **How many days at sea?** Days-at-sea (DAS) is the fishing industry's primary activity metric. A vessel with 30 DAS this year vs 45 DAS same period last year has a 33% activity decline — computable from AIS alone.
-- **Where is the vessel operating?** Fishing grounds shift with stock migration. A vessel moving from productive grounds to marginal ones may indicate access issues (quota allocation changes, territorial disputes).
-- **Is the vessel idle for maintenance or for distress?** A planned maintenance stop at a known shipyard (identifiable from port stays at shipyard coordinates) is different from an unplanned stop at the home berth.
+The API returns unnamed arrays. Verified mapping (cross-referenced against the named `PosMsg` endpoint for MMSI 257127870 at 2025-04-01T02:00:09Z):
 
-## Three data types collected
+| Position | Name | Type | Notes |
+|---|---|---|---|
+| 0 | `mmsi` | int64 | MMSI identifier |
+| 1 | `msgtime` | string | ISO timestamp (UTC, but displayed as Oslo local by the API) |
+| 2 | `lon` | float64 | WGS84 longitude |
+| 3 | `lat` | float64 | WGS84 latitude |
+| 4 | `cog` | float64 | Course over ground (deg, 0.1° resolution, 360.0 = default) |
+| 5 | `sog` | float64 | Speed over ground (knots, 0.1 kn res, 102.3 = N/A) |
+| 6 | `msg_type` | int64 | AIS message type (1,3 = Class A; 18 = Class B) |
+| 7 | `calc_speed` | float64 | Inter-point computed speed (kn), = col9/col8 × 1.944; -99 = N/A |
+| 8 | `sec_prevpoint` | int64 | Seconds since previous position; -99 = N/A; median = 10 |
+| 9 | `dist_prevpoint` | int64 | Meters since previous position; -99 = N/A |
+| 10 | `true_heading` | int64 | Gyrocompass heading (deg, 511 = N/A) |
+| 11 | `rot` | int64 | Rate of turn (signed, ±720 = max, -731 = N/A) |
 
-### 1. Positions (hourly)
-Every AIS position report for every vessel in the Norwegian EEZ, collected in 1-hour chunks.
+**`nav_status` is absent.** The per-vessel `PosMsg` endpoint includes it (0=underway, 1=anchored, 5=moored, 7=fishing), but this bulk endpoint substitutes calc_speed/sec_prevpoint/dist_prevpoint instead. Downstream phase classification must use SOG-only heuristics. BarentsWatch live DOES include nav_status.
 
-| Field | Description |
-|---|---|
-| `mmsi` | Maritime Mobile Service Identity — unique vessel radio identifier |
-| `msgtime` | Timestamp of the AIS transmission |
-| `lon`, `lat` | GPS coordinates (WGS84) |
-| `cog` | Course over ground (degrees) |
-| `sog` | Speed over ground (knots) |
-| `msg_type` | AIS message type (1/3 = Class A dynamic, 18 = Class B) |
-| `calc_speed` | Computed speed from consecutive positions (knots) |
-| `sec_prevpoint` | Seconds since previous position report |
-| `dist_prevpoint` | Meters since previous position report |
-| `true_heading` | Gyrocompass heading (degrees, 511 = not available) |
-| `rot` | Rate of turn (degrees/min, signed) |
+## Volume
 
-**Volume**: ~300,000 positions per hour, ~10 million per day, ~7 MB parquet per hour.
+~300K positions/hour, ~10M/day, ~7 MB snappy parquet per hour. 3-month backfill (Apr–Jun 2025) = 2,184 files, 15.3 GB.
 
-### 2. Statinfo / NSR vessel registry (daily)
-The Norwegian Ship Register (NSR) entry for every MMSI observed that day. This is how we know a vessel's name, call sign, IMO number, ship type, flag state, and dimensions.
+## NSR statinfo (daily)
 
-The call sign from NSR is the critical bridge: `mmsi → callsign → fartøyregisteret.radio_call_sign → orgnr`. Without this bridge, AIS positions have no corporate identity.
+Ship registry entries for every MMSI observed that day. Fields: `mmsino, callsign, shipname, imono, shiptypegroupnor, shiptypenor, grosstonnage, length, breadth, yearofbuild, countrynameeng, etc.`
 
-### 3. Voyages (daily)
-Kystverket's pre-computed voyage segments: origin port, destination port, ETD/ETA, cargo quantities, vessel characteristics at time of voyage. This is the Coastal Administration's own interpretation of "where did this vessel go?" — useful for validation against our MarU derivation.
+This is the bridge: `mmsi → callsign → fartøyregisteret.radio_call_sign → orgnr`. Without statinfo, AIS positions are anonymous.
 
-## Technical details
-
-- **API**: `POST https://kystdatahuset.no/ws/api/ais/positions/within-geom-time`
-- **Auth**: none (public NLOD license)
-- **Coverage**: Norwegian EEZ polygon `POLYGON((-2 55,35 55,35 82,-2 82,-2 55))`
-- **Backend**: PostgreSQL partitioned by month. Connection pool limit at ~8 concurrent clients (exceeding triggers `53300: too many clients` embedded in JSON response).
-- **Recency**: ~50-day ingestion lag at backend. Today's data is not available for ~50 days.
-- **History**: back to ~2007
+**Gotcha**: recent statinfo files (within the ~50-day lag window) may have 0 rows because the backend hasn't ingested that day's NSR data yet. The parser uses the largest available statinfo file for the bridge, not the most recent.
 
 ## GCS layout
 
 ```
 gs://sondre_brreg_data/ais/raw/
-├── positions/year={YYYY}/month={MM}/day={DD}/hour={HH}.parquet
-├── statinfo/year={YYYY}/month={MM}/day={DD}.parquet
-├── voyages/year={YYYY}/month={MM}/day={DD}.parquet
-├── _checkpoint/positions/{RUN_ID}.json
-└── _manifest/run={RUN_ID}.jsonl
+├── positions/year={Y}/month={M}/day={D}/hour={H}.parquet
+├── statinfo/year={Y}/month={M}/day={D}.parquet
+├── voyages/year={Y}/month={M}/day={D}.parquet
+└── _checkpoint/positions/{RUN_ID}.json
 ```
-
-## Important: `nav_status` is absent
-
-The bulk geom endpoint substitutes three inter-point metrics (calc_speed, sec_prevpoint, dist_prevpoint) where the per-vessel endpoint would have `navigational_status` (0=underway, 1=anchored, 5=moored, 7=fishing). This means the downstream parser cannot use the crew's self-declared fishing status and must fall back to speed-only heuristics. The BarentsWatch live poller (barentswatch-ais-live) DOES include nav_status.
 
 ## Cloud Run
 
-- **Backfill job**: `kystverket-ais-collector` (4CPU/16Gi, WORKERS=6)
-- **Daily job**: `kystverket-ais-collector-daily` (60-day rolling lookback)
-- **Schedule**: 06:00 Oslo daily
-- **Throughput**: ~15s per hour-chunk with 6 workers; daily run ~6 min, 3-month backfill ~5h
+| Job | Purpose | Resources | Schedule |
+|---|---|---|---|
+| `kystverket-ais-collector` | Backfill | 4CPU/16Gi, 6 workers, 6h timeout | manual |
+| `kystverket-ais-collector-daily` | Incremental (60-day lookback) | same | 06:00 Oslo |
 
 ## Downstream
 
-→ **kystverket-ais-parser**: decodes positions, adds H3 spatial index + orgnr bridge
-→ **barentswatch-ais-live**: uses NSR statinfo for the mmsi→callsign→orgnr bridge
+→ kystverket-ais-parser
